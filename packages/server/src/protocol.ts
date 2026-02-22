@@ -18,6 +18,12 @@ export type SyncClientMessage =
       value: NewDocumentRecord;
     }
   | {
+      type: "delete";
+      requestId: string;
+      table: string;
+      id: string;
+    }
+  | {
       type: "get";
       requestId: string;
       table: string;
@@ -44,15 +50,21 @@ export type SyncServerMessage =
   | {
       type: "result";
       requestId: string;
-      op: "insert" | "get" | "list";
+      op: "insert" | "delete" | "get" | "list";
       ok: true;
-      payload: DocumentRecord | DocumentRecord[];
+      payload: JsonValue;
+    }
+  | {
+      type: "snapshot";
+      table: string;
+      documents: DocumentRecord[];
     }
   | {
       type: "change";
       table: string;
-      op: "insert";
-      document: DocumentRecord;
+      op: "insert" | "delete";
+      document?: DocumentRecord;
+      id?: string;
     }
   | {
       type: "pong";
