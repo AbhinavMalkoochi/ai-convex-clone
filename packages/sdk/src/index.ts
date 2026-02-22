@@ -38,11 +38,12 @@ export const defineCollection = <T extends CollectionSchema>(schema: T): T => sc
 
 export const defineSchema = <T extends DatabaseSchema>(schema: T): T => schema;
 
-export const toSchemaJson = (schema: DatabaseSchema): string => {
-  return JSON.stringify(schema);
-};
+export const toSchemaJson = (schema: DatabaseSchema): string => JSON.stringify(schema);
 
 export const fromSchemaJson = (payload: string): DatabaseSchema => {
   const parsed = JSON.parse(payload) as DatabaseSchema;
   return parsed;
 };
+
+export { ConvexLikeClient, InMemoryStorageAdapter } from "./client";
+export type { DocumentRecord, NewDocumentRecord, StorageAdapter, WriteOperation } from "./client";
