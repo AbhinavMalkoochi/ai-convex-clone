@@ -1,5 +1,6 @@
 use crate::document::Document;
 use crate::error::{CoreError, CoreResult};
+use crate::index::{IndexDefinition, IndexRegistry};
 use crate::schema::{validate_document, SchemaDefinition};
 use crate::table::Table;
 use crate::values::{ConvexValue, DocumentId, TableName};
@@ -10,9 +11,11 @@ use std::collections::{BTreeMap, HashMap};
 /// Provides CRUD operations that route to the correct table,
 /// auto-generating DocumentIds and managing table lifecycle.
 /// Optionally enforces schema validation on writes.
+/// Maintains secondary indexes automatically on every write.
 #[derive(Debug, Default)]
 pub struct Database {
     tables: HashMap<TableName, Table>,
+    indexes: HashMap<TableName, IndexRegistry>,
     schema: Option<SchemaDefinition>,
 }
 
@@ -26,6 +29,7 @@ impl Database {
         self.tables
             .entry(name.to_owned())
             .or_insert_with(|| Table::new(name));
+        self.indexes.entry(name.to_owned()).or_default();
     }
 
     /// Get a reference to a table, returning an error if it doesn't exist.
@@ -68,6 +72,79 @@ impl Database {
         self.schema.as_ref()
     }
 
+    /// Create a secondary index on a table.
+    /// If the table already has documents, the index is rebuilt automatically.
+    pub fn create_index(&mut self, definition: IndexDefinition) -> CoreResult<()> {
+        let table_name = definition.table.clone();
+        let idx_name = definition.name.clone();
+        self.table(&table_name)?; // ensure table exists
+
+        let registry = self.indexes.entry(table_name.clone()).or_default();
+        registry.add_index(definition)?;
+
+        // Collect existing documents to backfill the new index
+        let docs: Vec<_> = self
+            .tables
+            .get(&table_name)
+            .expect("table verified above")
+            .iter()
+            .map(|d| (d.id().id().to_owned(), d.fields().clone()))
+            .collect();
+
+        let idx = self
+            .indexes
+            .get_mut(&table_name)
+            .expect("registry exists")
+            .get_index_mut(&idx_name)?;
+        for (doc_id, fields) in &docs {
+            idx.insert(doc_id, fields);
+        }
+        Ok(())
+    }
+
+    /// Remove a secondary index from a table.
+    pub fn remove_index(&mut self, table: &str, index_name: &str) -> CoreResult<()> {
+        self.indexes
+            .get_mut(table)
+            .ok_or_else(|| CoreError::TableNotFound(table.to_owned()))?
+            .remove_index(index_name)
+    }
+
+    /// Query an index by name, performing an equality lookup.
+    pub fn query_index(
+        &self,
+        table: &str,
+        index_name: &str,
+        values: &[ConvexValue],
+    ) -> CoreResult<Vec<&Document>> {
+        let registry = self
+            .indexes
+            .get(table)
+            .ok_or_else(|| CoreError::TableNotFound(table.to_owned()))?;
+        let idx = registry.get_index(index_name)?;
+        let doc_ids = idx.lookup(values);
+        let tbl = self.table(table)?;
+        doc_ids.into_iter().map(|id| tbl.get(id)).collect()
+    }
+
+    /// Query an index with a range scan.
+    pub fn query_index_range(
+        &self,
+        table: &str,
+        index_name: &str,
+        lower: Option<&[ConvexValue]>,
+        upper: Option<&[ConvexValue]>,
+    ) -> CoreResult<Vec<&Document>> {
+        let registry = self
+            .indexes
+            .get(table)
+            .ok_or_else(|| CoreError::TableNotFound(table.to_owned()))?;
+        let idx = registry.get_index(index_name)?;
+        let doc_ids = idx.range(lower, upper);
+        let tbl = self.table(table)?;
+        doc_ids.into_iter().map(|id| tbl.get(id)).collect()
+    }
+
     /// Validate fields against the table's schema (if one is defined).
     fn validate_fields(
         &self,
@@ -94,6 +171,9 @@ impl Database {
         self.validate_fields(table, &fields)?;
         let doc_id = DocumentId::generate(table);
         let doc = Document::new(doc_id.clone(), fields);
+        if let Some(registry) = self.indexes.get_mut(table) {
+            registry.on_insert(doc.id().id(), doc.fields());
+        }
         self.table_mut(table)?.insert(doc)?;
         Ok(doc_id)
     }
@@ -107,6 +187,9 @@ impl Database {
         let table_name = id.table().to_owned();
         self.validate_fields(&table_name, &fields)?;
         let doc = Document::new(id, fields);
+        if let Some(registry) = self.indexes.get_mut(&table_name) {
+            registry.on_insert(doc.id().id(), doc.fields());
+        }
         self.table_mut(&table_name)?.insert(doc)
     }
 
@@ -122,7 +205,15 @@ impl Database {
         fields: BTreeMap<String, ConvexValue>,
     ) -> CoreResult<()> {
         self.validate_fields(id.table(), &fields)?;
-        self.table_mut(id.table())?.replace(id.id(), fields)
+        // Capture old fields for index update
+        let old_fields = self.table(id.table())?.get(id.id())?.fields().clone();
+        self.table_mut(id.table())?.replace(id.id(), fields)?;
+        // Update indexes with old→new field diff
+        let new_fields = self.table(id.table())?.get(id.id())?.fields().clone();
+        if let Some(registry) = self.indexes.get_mut(id.table()) {
+            registry.on_update(id.id(), &old_fields, &new_fields);
+        }
+        Ok(())
     }
 
     /// Patch (merge) specific fields into an existing document.
@@ -132,12 +223,18 @@ impl Database {
         id: &DocumentId,
         fields: BTreeMap<String, ConvexValue>,
     ) -> CoreResult<()> {
+        // Capture old fields for index update
+        let old_fields = self.table(id.table())?.get(id.id())?.fields().clone();
         self.table_mut(id.table())?.patch(id.id(), fields)?;
+        let new_fields = self.table(id.table())?.get(id.id())?.fields().clone();
+        // Update indexes
+        if let Some(registry) = self.indexes.get_mut(id.table()) {
+            registry.on_update(id.id(), &old_fields, &new_fields);
+        }
         // Re-validate the full document after patching
         if let Some(schema) = &self.schema {
             if let Some(table_schema) = schema.get_table_schema(id.table()) {
-                let doc = self.table(id.table())?.get(id.id())?;
-                validate_document(doc.fields(), table_schema)
+                validate_document(&new_fields, table_schema)
                     .map_err(|msg| CoreError::SchemaViolation(format!("{}: {msg}", id.table())))?;
             }
         }
@@ -146,7 +243,11 @@ impl Database {
 
     /// Delete a document by its full DocumentId.
     pub fn delete(&mut self, id: &DocumentId) -> CoreResult<Document> {
-        self.table_mut(id.table())?.delete(id.id())
+        let doc = self.table_mut(id.table())?.delete(id.id())?;
+        if let Some(registry) = self.indexes.get_mut(id.table()) {
+            registry.on_remove(id.id(), doc.fields());
+        }
+        Ok(doc)
     }
 
     /// List all documents in a table.
@@ -449,4 +550,154 @@ mod tests {
         );
         assert!(result.is_ok());
     }
+
+    // --- Index tests ---
+
+    #[test]
+    fn create_index_and_query() {
+        let mut db = setup_db();
+        db.create_index(IndexDefinition {
+            name: "by_name".to_string(),
+            table: "users".to_string(),
+            fields: vec!["name".to_string()],
+        })
+        .unwrap();
+
+        let id = db.insert("users", user_fields("Alice", 30)).unwrap();
+        db.insert("users", user_fields("Bob", 25)).unwrap();
+
+        let results = db
+            .query_index("users", "by_name", &[ConvexValue::from("Alice")])
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id(), &id);
+    }
+
+    #[test]
+    fn index_updated_on_replace() {
+        let mut db = setup_db();
+        db.create_index(IndexDefinition {
+            name: "by_name".to_string(),
+            table: "users".to_string(),
+            fields: vec!["name".to_string()],
+        })
+        .unwrap();
+
+        let id = db.insert("users", user_fields("Alice", 30)).unwrap();
+
+        // Replace name
+        db.replace(&id, user_fields("Alicia", 30)).unwrap();
+
+        // Old name should not match
+        let results = db
+            .query_index("users", "by_name", &[ConvexValue::from("Alice")])
+            .unwrap();
+        assert!(results.is_empty());
+
+        // New name should match
+        let results = db
+            .query_index("users", "by_name", &[ConvexValue::from("Alicia")])
+            .unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn index_updated_on_patch() {
+        let mut db = setup_db();
+        db.create_index(IndexDefinition {
+            name: "by_age".to_string(),
+            table: "users".to_string(),
+            fields: vec!["age".to_string()],
+        })
+        .unwrap();
+
+        let id = db.insert("users", user_fields("Alice", 30)).unwrap();
+        db.patch(
+            &id,
+            BTreeMap::from([("age".to_string(), ConvexValue::from(31i64))]),
+        )
+        .unwrap();
+
+        let results = db
+            .query_index("users", "by_age", &[ConvexValue::from(30i64)])
+            .unwrap();
+        assert!(results.is_empty());
+
+        let results = db
+            .query_index("users", "by_age", &[ConvexValue::from(31i64)])
+            .unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn index_updated_on_delete() {
+        let mut db = setup_db();
+        db.create_index(IndexDefinition {
+            name: "by_name".to_string(),
+            table: "users".to_string(),
+            fields: vec!["name".to_string()],
+        })
+        .unwrap();
+
+        let id = db.insert("users", user_fields("Alice", 30)).unwrap();
+        db.delete(&id).unwrap();
+
+        let results = db
+            .query_index("users", "by_name", &[ConvexValue::from("Alice")])
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn index_range_query() {
+        let mut db = setup_db();
+        db.create_index(IndexDefinition {
+            name: "by_age".to_string(),
+            table: "users".to_string(),
+            fields: vec!["age".to_string()],
+        })
+        .unwrap();
+
+        db.insert("users", user_fields("Alice", 20)).unwrap();
+        db.insert("users", user_fields("Bob", 25)).unwrap();
+        db.insert("users", user_fields("Charlie", 30)).unwrap();
+        db.insert("users", user_fields("Diana", 35)).unwrap();
+
+        // age >= 25 and age < 35
+        let results = db
+            .query_index_range(
+                "users",
+                "by_age",
+                Some(&[ConvexValue::from(25i64)]),
+                Some(&[ConvexValue::from(35i64)]),
+            )
+            .unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn backfill_index_on_existing_data() {
+        let mut db = setup_db();
+        db.insert("users", user_fields("Alice", 30)).unwrap();
+        db.insert("users", user_fields("Bob", 25)).unwrap();
+
+        // Create index AFTER data exists — should backfill
+        db.create_index(IndexDefinition {
+            name: "by_name".to_string(),
+            table: "users".to_string(),
+            fields: vec!["name".to_string()],
+        })
+        .unwrap();
+
+        let results = db
+            .query_index("users", "by_name", &[ConvexValue::from("Alice")])
+            .unwrap();
+        assert_eq!(results.len(), 1);
+
+        let results = db
+            .query_index("users", "by_name", &[ConvexValue::from("Bob")])
+            .unwrap();
+        assert_eq!(results.len(), 1);
+    }
+}
 }
