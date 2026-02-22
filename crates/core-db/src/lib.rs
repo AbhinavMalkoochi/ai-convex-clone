@@ -6,4 +6,6 @@ pub mod types;
 pub use engine::InMemoryEngine;
 pub use error::{CoreError, CoreResult};
 pub use schema::{Schema, SchemaField, SchemaType};
-pub use types::{Document, DocumentId, TableName, Value};
+pub use types::{
+    Document, DocumentId, NewDocument, Revision, TableName, TableState, Value, WriteOperation,
+};
