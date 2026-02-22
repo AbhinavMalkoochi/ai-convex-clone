@@ -1,5 +1,6 @@
 use crate::document::Document;
 use crate::error::{CoreError, CoreResult};
+use crate::schema::{validate_document, SchemaDefinition};
 use crate::table::Table;
 use crate::values::{ConvexValue, DocumentId, TableName};
 use std::collections::{BTreeMap, HashMap};
@@ -8,9 +9,11 @@ use std::collections::{BTreeMap, HashMap};
 ///
 /// Provides CRUD operations that route to the correct table,
 /// auto-generating DocumentIds and managing table lifecycle.
+/// Optionally enforces schema validation on writes.
 #[derive(Debug, Default)]
 pub struct Database {
     tables: HashMap<TableName, Table>,
+    schema: Option<SchemaDefinition>,
 }
 
 impl Database {
@@ -49,6 +52,37 @@ impl Database {
         self.tables.keys().map(String::as_str).collect()
     }
 
+    /// Set a schema definition for the database.
+    /// When set, all writes are validated against the schema.
+    pub fn set_schema(&mut self, schema: SchemaDefinition) {
+        self.schema = Some(schema);
+    }
+
+    /// Remove the schema, disabling validation.
+    pub fn clear_schema(&mut self) {
+        self.schema = None;
+    }
+
+    /// Get the current schema definition, if any.
+    pub fn schema(&self) -> Option<&SchemaDefinition> {
+        self.schema.as_ref()
+    }
+
+    /// Validate fields against the table's schema (if one is defined).
+    fn validate_fields(
+        &self,
+        table: &str,
+        fields: &BTreeMap<String, ConvexValue>,
+    ) -> CoreResult<()> {
+        if let Some(schema) = &self.schema {
+            if let Some(table_schema) = schema.get_table_schema(table) {
+                validate_document(fields, table_schema)
+                    .map_err(|msg| CoreError::SchemaViolation(format!("{table}: {msg}")))?;
+            }
+        }
+        Ok(())
+    }
+
     /// Insert a new document into a table.
     /// Auto-generates a DocumentId (UUID v7) and sets _creationTime.
     /// The table must already exist.
@@ -57,6 +91,7 @@ impl Database {
         table: &str,
         fields: BTreeMap<String, ConvexValue>,
     ) -> CoreResult<DocumentId> {
+        self.validate_fields(table, &fields)?;
         let doc_id = DocumentId::generate(table);
         let doc = Document::new(doc_id.clone(), fields);
         self.table_mut(table)?.insert(doc)?;
@@ -70,6 +105,7 @@ impl Database {
         fields: BTreeMap<String, ConvexValue>,
     ) -> CoreResult<()> {
         let table_name = id.table().to_owned();
+        self.validate_fields(&table_name, &fields)?;
         let doc = Document::new(id, fields);
         self.table_mut(&table_name)?.insert(doc)
     }
@@ -85,16 +121,27 @@ impl Database {
         id: &DocumentId,
         fields: BTreeMap<String, ConvexValue>,
     ) -> CoreResult<()> {
+        self.validate_fields(id.table(), &fields)?;
         self.table_mut(id.table())?.replace(id.id(), fields)
     }
 
     /// Patch (merge) specific fields into an existing document.
+    /// After patching, the full document is re-validated against the schema.
     pub fn patch(
         &mut self,
         id: &DocumentId,
         fields: BTreeMap<String, ConvexValue>,
     ) -> CoreResult<()> {
-        self.table_mut(id.table())?.patch(id.id(), fields)
+        self.table_mut(id.table())?.patch(id.id(), fields)?;
+        // Re-validate the full document after patching
+        if let Some(schema) = &self.schema {
+            if let Some(table_schema) = schema.get_table_schema(id.table()) {
+                let doc = self.table(id.table())?.get(id.id())?;
+                validate_document(doc.fields(), table_schema)
+                    .map_err(|msg| CoreError::SchemaViolation(format!("{}: {msg}", id.table())))?;
+            }
+        }
+        Ok(())
     }
 
     /// Delete a document by its full DocumentId.
@@ -116,6 +163,7 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::{FieldDefinition, FieldType, SchemaDefinition, TableSchema};
 
     fn setup_db() -> Database {
         let mut db = Database::new();
@@ -282,5 +330,123 @@ mod tests {
         // Verify remaining doc
         let doc = db.get(&id2).unwrap();
         assert_eq!(doc.get("name"), Some(&ConvexValue::from("Charlie")));
+    }
+
+    // --- Schema validation tests ---
+
+    fn user_schema() -> TableSchema {
+        TableSchema::strict(BTreeMap::from([
+            (
+                "name".to_string(),
+                FieldDefinition::required(FieldType::String),
+            ),
+            (
+                "age".to_string(),
+                FieldDefinition::required(FieldType::Number),
+            ),
+        ]))
+    }
+
+    fn setup_db_with_schema() -> Database {
+        let mut db = Database::new();
+        db.create_table("users");
+        db.create_table("messages");
+        let mut schema = SchemaDefinition::new();
+        schema.define_table("users", user_schema());
+        db.set_schema(schema);
+        db
+    }
+
+    #[test]
+    fn schema_validates_insert() {
+        let mut db = setup_db_with_schema();
+
+        // Valid insert
+        let result = db.insert("users", user_fields("Alice", 30));
+        assert!(result.is_ok());
+
+        // Missing required field
+        let result = db.insert(
+            "users",
+            BTreeMap::from([("name".to_string(), ConvexValue::from("Bob"))]),
+        );
+        assert!(result.is_err());
+
+        // Wrong type
+        let result = db.insert(
+            "users",
+            BTreeMap::from([
+                ("name".to_string(), ConvexValue::from(123i64)),
+                ("age".to_string(), ConvexValue::from(30i64)),
+            ]),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn schema_validates_replace() {
+        let mut db = setup_db_with_schema();
+        let id = db.insert("users", user_fields("Alice", 30)).unwrap();
+
+        // Valid replace
+        assert!(db.replace(&id, user_fields("Bob", 25)).is_ok());
+
+        // Invalid replace (missing age)
+        let result = db.replace(
+            &id,
+            BTreeMap::from([("name".to_string(), ConvexValue::from("Charlie"))]),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn no_schema_table_allows_anything() {
+        let mut db = setup_db_with_schema();
+
+        // "messages" has no schema defined, so accepts anything
+        let result = db.insert(
+            "messages",
+            BTreeMap::from([("whatever".to_string(), ConvexValue::from(true))]),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn no_schema_allows_everything() {
+        let mut db = setup_db();
+        // No schema set at all, everything is valid
+        let result = db.insert(
+            "users",
+            BTreeMap::from([("anything".to_string(), ConvexValue::from(true))]),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn clear_schema_disables_validation() {
+        let mut db = setup_db_with_schema();
+
+        // With schema, wrong type fails
+        let result = db.insert(
+            "users",
+            BTreeMap::from([
+                ("name".to_string(), ConvexValue::from(123i64)),
+                ("age".to_string(), ConvexValue::from(30i64)),
+            ]),
+        );
+        assert!(result.is_err());
+
+        // Clear schema
+        db.clear_schema();
+
+        // Now the same insert succeeds
+        let result = db.insert(
+            "users",
+            BTreeMap::from([
+                ("name".to_string(), ConvexValue::from(123i64)),
+                ("age".to_string(), ConvexValue::from(30i64)),
+            ]),
+        );
+        assert!(result.is_ok());
     }
 }
