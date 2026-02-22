@@ -47,3 +47,5 @@ export const fromSchemaJson = (payload: string): DatabaseSchema => {
 
 export { ConvexLikeClient, InMemoryStorageAdapter } from "./client";
 export type { DocumentRecord, NewDocumentRecord, StorageAdapter, WriteOperation } from "./client";
+export { BrowserWebSocketTransport, RealtimeClient } from "./realtimeClient";
+export type { RealtimeTransport, RealtimeTransportFactory } from "./realtimeClient";
