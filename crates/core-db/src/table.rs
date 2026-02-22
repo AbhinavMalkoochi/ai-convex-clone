@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 ///
 /// Uses a BTreeMap for ordered storage, enabling efficient range scans
 /// and ordered iteration (important for index support in later phases).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Table {
     name: String,
     docs: BTreeMap<String, Document>,

@@ -3,8 +3,9 @@ use crate::error::{CoreError, CoreResult};
 use crate::index::{IndexDefinition, IndexRegistry};
 use crate::schema::{validate_document, SchemaDefinition};
 use crate::table::Table;
+use crate::transaction::Transaction;
 use crate::values::{ConvexValue, DocumentId, TableName};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// The top-level database holding multiple tables.
 ///
@@ -12,11 +13,14 @@ use std::collections::{BTreeMap, HashMap};
 /// auto-generating DocumentIds and managing table lifecycle.
 /// Optionally enforces schema validation on writes.
 /// Maintains secondary indexes automatically on every write.
+/// Tracks document versions for MVCC conflict detection.
 #[derive(Debug, Default)]
 pub struct Database {
     tables: HashMap<TableName, Table>,
     indexes: HashMap<TableName, IndexRegistry>,
     schema: Option<SchemaDefinition>,
+    version: u64,
+    doc_versions: HashMap<(TableName, String), u64>,
 }
 
 impl Database {
@@ -175,6 +179,9 @@ impl Database {
             registry.on_insert(doc.id().id(), doc.fields());
         }
         self.table_mut(table)?.insert(doc)?;
+        self.version += 1;
+        self.doc_versions
+            .insert((table.to_owned(), doc_id.id().to_owned()), self.version);
         Ok(doc_id)
     }
 
@@ -187,10 +194,15 @@ impl Database {
         let table_name = id.table().to_owned();
         self.validate_fields(&table_name, &fields)?;
         let doc = Document::new(id, fields);
+        let doc_id_str = doc.id().id().to_owned();
         if let Some(registry) = self.indexes.get_mut(&table_name) {
             registry.on_insert(doc.id().id(), doc.fields());
         }
-        self.table_mut(&table_name)?.insert(doc)
+        self.table_mut(&table_name)?.insert(doc)?;
+        self.version += 1;
+        self.doc_versions
+            .insert((table_name, doc_id_str), self.version);
+        Ok(())
     }
 
     /// Get a document by its full DocumentId.
@@ -213,6 +225,9 @@ impl Database {
         if let Some(registry) = self.indexes.get_mut(id.table()) {
             registry.on_update(id.id(), &old_fields, &new_fields);
         }
+        self.version += 1;
+        self.doc_versions
+            .insert((id.table().to_owned(), id.id().to_owned()), self.version);
         Ok(())
     }
 
@@ -238,6 +253,9 @@ impl Database {
                     .map_err(|msg| CoreError::SchemaViolation(format!("{}: {msg}", id.table())))?;
             }
         }
+        self.version += 1;
+        self.doc_versions
+            .insert((id.table().to_owned(), id.id().to_owned()), self.version);
         Ok(())
     }
 
@@ -247,6 +265,9 @@ impl Database {
         if let Some(registry) = self.indexes.get_mut(id.table()) {
             registry.on_remove(id.id(), doc.fields());
         }
+        self.version += 1;
+        self.doc_versions
+            .insert((id.table().to_owned(), id.id().to_owned()), self.version);
         Ok(doc)
     }
 
@@ -258,6 +279,55 @@ impl Database {
     /// Count documents in a table.
     pub fn count(&self, table: &str) -> CoreResult<usize> {
         Ok(self.table(table)?.len())
+    }
+
+    /// Get the current database version (monotonically increasing on each commit/write).
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Begin a new MVCC transaction.
+    /// The transaction receives a snapshot (clone) of the current database state.
+    pub fn begin(&self) -> Transaction {
+        Transaction {
+            tables: self.tables.clone(),
+            indexes: self.indexes.clone(),
+            schema: self.schema.clone(),
+            read_set: HashSet::new(),
+            write_set: HashSet::new(),
+            begin_version: self.version,
+        }
+    }
+
+    /// Commit a transaction, applying its writes atomically.
+    /// Fails with `TransactionConflict` if any document in the transaction's
+    /// read or write set was modified after the transaction began.
+    pub fn commit(&mut self, tx: Transaction) -> CoreResult<()> {
+        // Conflict detection: check that no touched document was modified
+        for (table, doc_id) in tx.read_set.iter().chain(tx.write_set.iter()) {
+            if let Some(&ver) = self.doc_versions.get(&(table.clone(), doc_id.clone())) {
+                if ver > tx.begin_version {
+                    return Err(CoreError::TransactionConflict(format!(
+                        "{table}:{doc_id} modified at version {ver}, transaction began at {}",
+                        tx.begin_version
+                    )));
+                }
+            }
+        }
+
+        // No conflicts — apply the transaction's state
+        self.version += 1;
+        self.tables = tx.tables;
+        self.indexes = tx.indexes;
+        self.schema = tx.schema;
+
+        // Update doc_versions for all written documents
+        for (table, doc_id) in &tx.write_set {
+            self.doc_versions
+                .insert((table.clone(), doc_id.clone()), self.version);
+        }
+
+        Ok(())
     }
 }
 
@@ -699,5 +769,4 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
     }
-}
 }

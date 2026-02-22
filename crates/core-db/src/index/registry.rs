@@ -18,7 +18,7 @@ pub struct IndexDefinition {
 /// Manages all indexes for a single table.
 ///
 /// Automatically maintains indexes when documents are inserted, updated, or deleted.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct IndexRegistry {
     indexes: BTreeMap<String, Index>,
 }

@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Maps composite key values (from one or more document fields) to the set
 /// of document IDs that have those values. Supports equality lookups,
 /// range scans, and ordered iteration.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Index {
     definition: IndexDefinition,
     /// Maps (indexed field values) → set of document ID strings.
