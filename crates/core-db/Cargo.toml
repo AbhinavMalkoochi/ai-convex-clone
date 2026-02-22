@@ -11,5 +11,12 @@ serde_json = "1.0"
 thiserror = "2.0"
 uuid = { version = "1.15", features = ["serde", "v7"] }
 
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "write_batch"
+harness = false
+
 [lints]
 workspace = true
