@@ -1,0 +1,18 @@
+{
+  "name": "ai-convex-clone",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "scripts": {
+    "build": "bun run build:ts && cargo build --workspace",
+    "build:ts": "bun run --filter @acx/sdk build",
+    "lint": "bun run lint:ts && cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings",
+    "lint:ts": "biome check .",
+    "format": "biome format --write . && cargo fmt --all",
+    "test": "bun run test:ts && cargo test --workspace",
+    "test:ts": "bun test"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "1.9.4",
+    "typescript": "5.8.2"
+  }
+}

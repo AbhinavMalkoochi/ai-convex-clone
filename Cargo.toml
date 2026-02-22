@@ -1,0 +1,11 @@
+[workspace]
+members = ["crates/core-db"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+authors = ["Abhinav Malkoochi"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
